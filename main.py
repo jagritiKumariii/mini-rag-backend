@@ -7,7 +7,7 @@ import time
 from dotenv import load_dotenv
 
 from pinecone import Pinecone, ServerlessSpec
-import google.generativeai as genai
+from google import genai
 
 from sentence_transformers import SentenceTransformer
 
@@ -40,11 +40,10 @@ app.add_middleware(
 )
 
 # -------------------------------------------------
-# Gemini setup (LLM only)
+# Gemini (NEW SDK – STABLE)
 # -------------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
-llm_model = genai.GenerativeModel("gemini-pro")
-
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = "models/gemini-1.5-flash"  # free + stable
 
 # -------------------------------------------------
 # Local embedding model (CPU ONLY)
@@ -115,11 +114,11 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
 
 
 def get_embedding(text: str) -> list[float]:
-    emb = embedding_model.encode(
+    embedding = embedding_model.encode(
         text,
         normalize_embeddings=True
     )
-    return emb.tolist()
+    return embedding.tolist()
 
 # -------------------------------------------------
 # Routes
@@ -135,15 +134,13 @@ async def upload_text(data: TextInput):
 
     try:
         chunks = chunk_text(data.text)
-
         vectors = []
-        timestamp = int(time.time())
+        ts = int(time.time())
 
         for chunk in chunks:
-            embedding = get_embedding(chunk["text"])
             vectors.append({
-                "id": f"chunk-{timestamp}-{chunk['id']}",
-                "values": embedding,
+                "id": f"chunk-{ts}-{chunk['id']}",
+                "values": get_embedding(chunk["text"]),
                 "metadata": {
                     "text": chunk["text"],
                     "chunk_id": chunk["id"],
@@ -168,19 +165,15 @@ async def upload_file(file: UploadFile = File(...)):
     start_time = time.time()
 
     try:
-        content = await file.read()
-        text = content.decode("utf-8")
-
+        text = (await file.read()).decode("utf-8")
         chunks = chunk_text(text)
-
         vectors = []
-        timestamp = int(time.time())
+        ts = int(time.time())
 
         for chunk in chunks:
-            embedding = get_embedding(chunk["text"])
             vectors.append({
-                "id": f"chunk-{timestamp}-{chunk['id']}",
-                "values": embedding,
+                "id": f"chunk-{ts}-{chunk['id']}",
+                "values": get_embedding(chunk["text"]),
                 "metadata": {
                     "text": chunk["text"],
                     "chunk_id": chunk["id"],
@@ -216,7 +209,7 @@ async def query_docs(data: QueryInput):
 
         if not results.matches:
             return QueryResponse(
-                answer="I couldn't find relevant information in the uploaded data.",
+                answer="No relevant information found.",
                 citations=[],
                 chunks_retrieved=0,
                 time_taken=round(time.time() - start_time, 2)
@@ -226,7 +219,7 @@ async def query_docs(data: QueryInput):
         citations = []
 
         for i, match in enumerate(results.matches[:3]):
-            text = match.metadata.get("text", "")
+            text = match.metadata["text"]
             context_blocks.append(f"[{i+1}] {text}")
             citations.append({
                 "id": i + 1,
@@ -238,7 +231,6 @@ async def query_docs(data: QueryInput):
         context = "\n\n".join(context_blocks)
 
         prompt = f"""
-You are a helpful assistant.
 Answer the question using ONLY the context below.
 Use citations like [1], [2].
 
@@ -251,16 +243,16 @@ Question:
 Answer:
 """
 
-        response = llm_model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
 
-        if not response or not hasattr(response, "text"):
+        if not response or not response.text:
             raise RuntimeError("Gemini returned empty response")
 
-        answer = response.text.strip()
-
-
         return QueryResponse(
-            answer=answer,
+            answer=response.text.strip(),
             citations=citations,
             chunks_retrieved=len(results.matches),
             time_taken=round(time.time() - start_time, 2)
@@ -270,9 +262,6 @@ Answer:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -------------------------------------------------
-# Local run (ignored by Railway)
-# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
