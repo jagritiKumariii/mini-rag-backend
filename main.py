@@ -43,7 +43,8 @@ app.add_middleware(
 # Gemini setup (LLM only)
 # -------------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-llm_model = genai.GenerativeModel("gemini-pro")
+llm_model = genai.GenerativeModel("models/gemini-1.5-flash")
+
 
 # -------------------------------------------------
 # Local embedding model (CPU ONLY)
@@ -251,7 +252,12 @@ Answer:
 """
 
         response = llm_model.generate_content(prompt)
+
+        if not response or not hasattr(response, "text"):
+            raise RuntimeError("Gemini returned empty response")
+
         answer = response.text.strip()
+
 
         return QueryResponse(
             answer=answer,
