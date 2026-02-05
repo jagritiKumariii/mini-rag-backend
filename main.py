@@ -7,7 +7,6 @@ import time
 from dotenv import load_dotenv
 
 from pinecone import Pinecone, ServerlessSpec
-from google import genai
 from sentence_transformers import SentenceTransformer
 
 # =================================================
@@ -15,12 +14,8 @@ from sentence_transformers import SentenceTransformer
 # =================================================
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set")
 
 if not PINECONE_API_KEY:
     raise RuntimeError("PINECONE_API_KEY not set")
@@ -39,23 +34,6 @@ app.add_middleware(
 )
 
 # =================================================
-# Gemini (NEW SDK ONLY)
-# =================================================
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = "models/gemini-1.5-flash-001"
-
-def generate_answer(prompt: str) -> str:
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt
-    )
-
-    if not response or not response.text:
-        raise RuntimeError("Gemini returned empty response")
-
-    return response.text.strip()
-
-# =================================================
 # Local embedding model (CPU ONLY)
 # =================================================
 embedding_model = SentenceTransformer(
@@ -66,11 +44,8 @@ embedding_model = SentenceTransformer(
 EMBEDDING_DIM = 384
 
 def get_embedding(text: str) -> List[float]:
-    embedding = embedding_model.encode(
-        text,
-        normalize_embeddings=True
-    )
-    return embedding.tolist()
+    emb = embedding_model.encode(text, normalize_embeddings=True)
+    return emb.tolist()
 
 # =================================================
 # Pinecone setup
@@ -91,7 +66,7 @@ if PINECONE_INDEX_NAME not in pc.list_indexes().names():
 index = pc.Index(PINECONE_INDEX_NAME)
 
 # =================================================
-# Request / Response Models
+# Models
 # =================================================
 class TextInput(BaseModel):
     text: str
@@ -138,132 +113,70 @@ def health():
 
 @app.post("/api/upload-text")
 async def upload_text(data: TextInput):
-    start_time = time.time()
+    start = time.time()
+    chunks = chunk_text(data.text)
+    ts = int(time.time())
 
-    try:
-        chunks = chunk_text(data.text)
-        vectors = []
-        ts = int(time.time())
+    vectors = []
+    for chunk in chunks:
+        vectors.append({
+            "id": f"chunk-{ts}-{chunk['id']}",
+            "values": get_embedding(chunk["text"]),
+            "metadata": {
+                "text": chunk["text"],
+                "chunk_id": chunk["id"],
+                "source": "user_text"
+            }
+        })
 
-        for chunk in chunks:
-            vectors.append({
-                "id": f"chunk-{ts}-{chunk['id']}",
-                "values": get_embedding(chunk["text"]),
-                "metadata": {
-                    "text": chunk["text"],
-                    "chunk_id": chunk["id"],
-                    "source": "user_text"
-                }
-            })
+    index.upsert(vectors=vectors)
 
-        index.upsert(vectors=vectors)
-
-        return {
-            "status": "success",
-            "chunks_created": len(chunks),
-            "time_taken": round(time.time() - start_time, 2)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/upload-file")
-async def upload_file(file: UploadFile = File(...)):
-    start_time = time.time()
-
-    try:
-        text = (await file.read()).decode("utf-8")
-        chunks = chunk_text(text)
-        vectors = []
-        ts = int(time.time())
-
-        for chunk in chunks:
-            vectors.append({
-                "id": f"chunk-{ts}-{chunk['id']}",
-                "values": get_embedding(chunk["text"]),
-                "metadata": {
-                    "text": chunk["text"],
-                    "chunk_id": chunk["id"],
-                    "source": file.filename
-                }
-            })
-
-        index.upsert(vectors=vectors)
-
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "chunks_created": len(chunks),
-            "time_taken": round(time.time() - start_time, 2)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "status": "success",
+        "chunks_created": len(chunks),
+        "time_taken": round(time.time() - start, 2)
+    }
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query_docs(data: QueryInput):
-    start_time = time.time()
+    start = time.time()
 
-    try:
-        query_embedding = get_embedding(data.query)
+    query_emb = get_embedding(data.query)
+    results = index.query(
+        vector=query_emb,
+        top_k=data.top_k,
+        include_metadata=True
+    )
 
-        results = index.query(
-            vector=query_embedding,
-            top_k=data.top_k,
-            include_metadata=True
-        )
-
-        if not results.matches:
-            return QueryResponse(
-                answer="No relevant information found.",
-                citations=[],
-                chunks_retrieved=0,
-                time_taken=round(time.time() - start_time, 2)
-            )
-
-        context_blocks = []
-        citations = []
-
-        for i, match in enumerate(results.matches[:3]):
-            text = match.metadata["text"]
-            context_blocks.append(f"[{i+1}] {text}")
-            citations.append({
-                "id": i + 1,
-                "source": match.metadata.get("source", "unknown"),
-                "score": round(match.score, 3),
-                "preview": text[:200] + "..."
-            })
-
-        context = "\n\n".join(context_blocks)
-
-        prompt = f"""
-Answer the question using ONLY the context below.
-Use citations like [1], [2].
-
-Context:
-{context}
-
-Question:
-{data.query}
-
-Answer:
-"""
-
-        answer = generate_answer(prompt)
-
+    if not results.matches:
         return QueryResponse(
-            answer=answer,
-            citations=citations,
-            chunks_retrieved=len(results.matches),
-            time_taken=round(time.time() - start_time, 2)
+            answer="No relevant information found.",
+            citations=[],
+            chunks_retrieved=0,
+            time_taken=round(time.time() - start, 2)
         )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    citations = []
+    context = []
 
-# =================================================
-# Local run
-# =================================================
+    for i, match in enumerate(results.matches[:3]):
+        text = match.metadata["text"]
+        context.append(f"[{i+1}] {text}")
+        citations.append({
+            "id": i + 1,
+            "score": round(match.score, 3),
+            "preview": text[:200] + "..."
+        })
+
+    answer = "\n\n".join(context)
+
+    return QueryResponse(
+        answer=answer,
+        citations=citations,
+        chunks_retrieved=len(results.matches),
+        time_taken=round(time.time() - start, 2)
+    )
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
