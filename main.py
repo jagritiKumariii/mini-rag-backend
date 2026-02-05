@@ -96,22 +96,23 @@ HF_API_KEY = os.getenv("HF_API_KEY")
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 def get_embedding(text: str) -> list[float]:
-    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+    url = "https://api-inference.huggingface.co/models/intfloat/e5-small-v2"
     headers = {
         "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json"
     }
+
+    # IMPORTANT: e5 models require prefix
     payload = {
-        "inputs": text
+        "inputs": f"passage: {text}"
     }
 
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
 
     embedding = response.json()
-
-    # HF returns [ [embedding] ] for feature-extraction models
     return embedding[0]
+ 
 
 
 
