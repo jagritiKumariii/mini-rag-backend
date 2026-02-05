@@ -1,20 +1,36 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 import os
-from dotenv import load_dotenv
 import time
+from dotenv import load_dotenv
+
 from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
 
+from sentence_transformers import SentenceTransformer
 
-
+# -------------------------------------------------
+# Load environment variables
+# -------------------------------------------------
 load_dotenv()
 
-app = FastAPI()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 
-# CORS middleware
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY not set")
+
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY not set")
+
+# -------------------------------------------------
+# FastAPI app
+# -------------------------------------------------
+app = FastAPI(title="Mini RAG API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,30 +39,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize clients
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+# -------------------------------------------------
+# Gemini setup (LLM only)
+# -------------------------------------------------
+genai.configure(api_key=GEMINI_API_KEY)
+llm_model = genai.GenerativeModel("gemini-pro")
 
-# Initialize embedding model (runs locally, completely free!)
+# -------------------------------------------------
+# Local embedding model (CPU ONLY)
+# -------------------------------------------------
+embedding_model = SentenceTransformer(
+    "all-MiniLM-L6-v2",
+    device="cpu"
+)
 
+EMBEDDING_DIM = 384
 
-INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
+# -------------------------------------------------
+# Pinecone setup
+# -------------------------------------------------
+pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# Initialize Pinecone index
-if INDEX_NAME not in pc.list_indexes().names():
+if PINECONE_INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
-        name=INDEX_NAME,
-        dimension=384,  # all-MiniLM-L6-v2 dimension
-        metric='cosine',
+        name=PINECONE_INDEX_NAME,
+        dimension=EMBEDDING_DIM,
+        metric="cosine",
         spec=ServerlessSpec(
-            cloud='aws',
-            region='us-east-1'
+            cloud="aws",
+            region="us-east-1"
         )
     )
 
-index = pc.Index(INDEX_NAME)
+index = pc.Index(PINECONE_INDEX_NAME)
 
+# -------------------------------------------------
 # Models
+# -------------------------------------------------
 class TextInput(BaseModel):
     text: str
 
@@ -58,250 +87,186 @@ class QueryResponse(BaseModel):
     answer: str
     citations: List[dict]
     chunks_retrieved: int
-    tokens_used: int
     time_taken: float
 
-# Chunking function
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[dict]:
-    """Split text into overlapping chunks with metadata"""
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
     words = text.split()
     chunks = []
-    
     start = 0
-    chunk_id = 0
-    
+    cid = 0
+
     while start < len(words):
         end = start + chunk_size
         chunk_words = words[start:end]
-        chunk_text = " ".join(chunk_words)
-        
+
         chunks.append({
-            "text": chunk_text,
-            "metadata": {
-                "chunk_id": chunk_id,
-                "start_pos": start,
-                "end_pos": end,
-                "chunk_size": len(chunk_words)
-            }
+            "id": cid,
+            "text": " ".join(chunk_words)
         })
-        
-        chunk_id += 1
+
+        cid += 1
         start += chunk_size - overlap
-    
+
     return chunks
 
-import requests
-
-HF_API_KEY = os.getenv("HF_API_KEY")
-HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 def get_embedding(text: str) -> list[float]:
-    url = "https://api-inference.huggingface.co/models/intfloat/e5-small-v2"
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    emb = embedding_model.encode(
+        text,
+        normalize_embeddings=True
+    )
+    return emb.tolist()
 
-    # IMPORTANT: e5 models require prefix
-    payload = {
-        "inputs": f"passage: {text}"
-    }
-
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
-
-    embedding = response.json()
-    return embedding[0]
- 
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
+@app.get("/")
+def health():
+    return {"status": "healthy", "service": "Mini RAG API"}
 
 
-
-# Simple reranking function (no API needed)
-def rerank_chunks(query: str, chunks: List[dict], top_n: int = 3) -> List[dict]:
-    """Simple reranking based on keyword matching and score"""
-    # Sort by existing score (already good from vector search)
-    sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
-    return sorted_chunks[:top_n]
-
-# Store text endpoint
 @app.post("/api/upload-text")
-async def upload_text(input_data: TextInput):
+async def upload_text(data: TextInput):
     start_time = time.time()
-    
+
     try:
-        # Chunk the text
-        chunks = chunk_text(input_data.text)
-        
-        # Generate embeddings and upsert to Pinecone
+        chunks = chunk_text(data.text)
+
         vectors = []
-        for i, chunk in enumerate(chunks):
+        timestamp = int(time.time())
+
+        for chunk in chunks:
             embedding = get_embedding(chunk["text"])
             vectors.append({
-                "id": f"chunk_{i}_{int(time.time())}",
+                "id": f"chunk-{timestamp}-{chunk['id']}",
                 "values": embedding,
                 "metadata": {
                     "text": chunk["text"],
-                    "chunk_id": chunk["metadata"]["chunk_id"],
-                    "source": "user_input"
+                    "chunk_id": chunk["id"],
+                    "source": "user_text"
                 }
             })
-        
-        # Upsert in batches
-        batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch)
-        
-        time_taken = time.time() - start_time
-        
+
+        index.upsert(vectors=vectors)
+
         return {
             "status": "success",
             "chunks_created": len(chunks),
-            "time_taken": round(time_taken, 2)
+            "time_taken": round(time.time() - start_time, 2)
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Upload file endpoint
+
 @app.post("/api/upload-file")
 async def upload_file(file: UploadFile = File(...)):
     start_time = time.time()
-    
+
     try:
-        # Read file content
         content = await file.read()
-        text = content.decode('utf-8')
-        
-        # Chunk the text
+        text = content.decode("utf-8")
+
         chunks = chunk_text(text)
-        
-        # Generate embeddings and upsert
+
         vectors = []
-        for i, chunk in enumerate(chunks):
+        timestamp = int(time.time())
+
+        for chunk in chunks:
             embedding = get_embedding(chunk["text"])
             vectors.append({
-                "id": f"chunk_{i}_{int(time.time())}",
+                "id": f"chunk-{timestamp}-{chunk['id']}",
                 "values": embedding,
                 "metadata": {
                     "text": chunk["text"],
-                    "chunk_id": chunk["metadata"]["chunk_id"],
+                    "chunk_id": chunk["id"],
                     "source": file.filename
                 }
             })
-        
-        # Upsert in batches
-        batch_size = 100
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch)
-        
-        time_taken = time.time() - start_time
-        
+
+        index.upsert(vectors=vectors)
+
         return {
             "status": "success",
             "filename": file.filename,
             "chunks_created": len(chunks),
-            "time_taken": round(time_taken, 2)
+            "time_taken": round(time.time() - start_time, 2)
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Query endpoint
+
 @app.post("/api/query", response_model=QueryResponse)
-async def query(query_input: QueryInput):
+async def query_docs(data: QueryInput):
     start_time = time.time()
-    
+
     try:
-        # Get query embedding
-        query_embedding = get_embedding(query_input.query)
-        
-        # Retrieve from Pinecone
+        query_embedding = get_embedding(data.query)
+
         results = index.query(
             vector=query_embedding,
-            top_k=query_input.top_k,
+            top_k=data.top_k,
             include_metadata=True
         )
-        
-        # Extract chunks
-        retrieved_chunks = [
-            {
-                "text": match.metadata.get("text", ""),
-                "score": match.score,
-                "source": match.metadata.get("source", "unknown"),
-                "chunk_id": match.metadata.get("chunk_id", 0)
-            }
-            for match in results.matches
-        ]
-        
-        if not retrieved_chunks:
+
+        if not results.matches:
             return QueryResponse(
-                answer="I couldn't find any relevant information to answer your query.",
+                answer="I couldn't find relevant information in the uploaded data.",
                 citations=[],
                 chunks_retrieved=0,
-                tokens_used=0,
                 time_taken=round(time.time() - start_time, 2)
             )
-        
-        # Simple reranking (no API needed)
-        reranked_chunks = rerank_chunks(query_input.query, retrieved_chunks, top_n=3)
-        
-        # Build context for LLM
-        context = "\n\n".join([
-            f"[{i+1}] {chunk['text']}"
-            for i, chunk in enumerate(reranked_chunks)
-        ])
-        
-        # Generate answer with Gemini (FREE!)
-        prompt = f"""Based on the following context, answer the user's question. 
-Use inline citations like [1], [2], etc. to reference the sources.
-If the context doesn't contain enough information, say so.
+
+        context_blocks = []
+        citations = []
+
+        for i, match in enumerate(results.matches[:3]):
+            text = match.metadata.get("text", "")
+            context_blocks.append(f"[{i+1}] {text}")
+            citations.append({
+                "id": i + 1,
+                "source": match.metadata.get("source", "unknown"),
+                "score": round(match.score, 3),
+                "preview": text[:200] + "..."
+            })
+
+        context = "\n\n".join(context_blocks)
+
+        prompt = f"""
+You are a helpful assistant.
+Answer the question using ONLY the context below.
+Use citations like [1], [2].
 
 Context:
 {context}
 
-Question: {query_input.query}
+Question:
+{data.query}
 
-Answer with citations:"""
-        
-        model = genai.GenerativeModel('gemini-pro')
-        response = model.generate_content(prompt)
-        
-        answer = response.text
-        
-        # Estimate tokens (Gemini doesn't provide exact count in free tier)
-        tokens_used = len(prompt.split()) + len(answer.split())
-        
-        # Format citations
-        citations = [
-            {
-                "id": i + 1,
-                "text": chunk["text"][:200] + "...",
-                "source": chunk["source"],
-                "relevance_score": round(chunk["score"], 3)
-            }
-            for i, chunk in enumerate(reranked_chunks)
-        ]
-        
-        time_taken = time.time() - start_time
-        
+Answer:
+"""
+
+        response = llm_model.generate_content(prompt)
+        answer = response.text.strip()
+
         return QueryResponse(
             answer=answer,
             citations=citations,
-            chunks_retrieved=len(retrieved_chunks),
-            tokens_used=tokens_used,
-            time_taken=round(time_taken, 2)
+            chunks_retrieved=len(results.matches),
+            time_taken=round(time.time() - start_time, 2)
         )
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Health check
-@app.get("/")
-async def health_check():
-    return {"status": "healthy", "service": "Mini RAG API"}
 
+# -------------------------------------------------
+# Local run (ignored by Railway)
+# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
