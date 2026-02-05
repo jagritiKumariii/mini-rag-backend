@@ -96,21 +96,23 @@ HF_API_KEY = os.getenv("HF_API_KEY")
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 def get_embedding(text: str) -> list[float]:
-    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
+    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
     headers = {
         "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "inputs": text,
-        "options": {"wait_for_model": True}
+        "inputs": text
     }
 
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
 
     embedding = response.json()
-    return embedding[0]  # first vector
+
+    # HF returns [ [embedding] ] for feature-extraction models
+    return embedding[0]
+
 
 
 # Simple reranking function (no API needed)
