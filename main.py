@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 import time
 from pinecone import Pinecone, ServerlessSpec
 import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-import tiktoken
+
+
 
 load_dotenv()
 
@@ -28,7 +28,7 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
 # Initialize embedding model (runs locally, completely free!)
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 
@@ -36,7 +36,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 if INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
         name=INDEX_NAME,
-        dimension=384,  # all-MiniLM-L6-v2 dimension
+        dimension=768,  # all-MiniLM-L6-v2 dimension
         metric='cosine',
         spec=ServerlessSpec(
             cloud='aws',
@@ -91,10 +91,15 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[dict
     return chunks
 
 # Embedding function (FREE - runs locally)
-def get_embedding(text: str) -> List[float]:
-    """Get embedding using local model"""
-    embedding = embedding_model.encode(text)
-    return embedding.tolist()
+def get_embedding(text: str) -> list[float]:
+    embedding_model = "models/embedding-001"
+    result = genai.embed_content(
+        model=embedding_model,
+        content=text,
+        task_type="retrieval_document"
+    )
+    return result["embedding"]
+
 
 # Simple reranking function (no API needed)
 def rerank_chunks(query: str, chunks: List[dict], top_n: int = 3) -> List[dict]:
