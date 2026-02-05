@@ -43,7 +43,7 @@ app.add_middleware(
 # Gemini setup (LLM only)
 # -------------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-llm_model = genai.GenerativeModel("models/gemini-1.5-flash")
+llm_model = genai.GenerativeModel("models/gemini-1.0-pro")
 
 
 # -------------------------------------------------
