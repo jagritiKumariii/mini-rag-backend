@@ -8,12 +8,11 @@ from dotenv import load_dotenv
 
 from pinecone import Pinecone, ServerlessSpec
 from google import genai
-
 from sentence_transformers import SentenceTransformer
 
-# -------------------------------------------------
+# =================================================
 # Load environment variables
-# -------------------------------------------------
+# =================================================
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -26,9 +25,9 @@ if not GEMINI_API_KEY:
 if not PINECONE_API_KEY:
     raise RuntimeError("PINECONE_API_KEY not set")
 
-# -------------------------------------------------
+# =================================================
 # FastAPI app
-# -------------------------------------------------
+# =================================================
 app = FastAPI(title="Mini RAG API")
 
 app.add_middleware(
@@ -39,15 +38,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------
-# Gemini (NEW SDK – STABLE)
-# -------------------------------------------------
+# =================================================
+# Gemini (NEW SDK ONLY)
+# =================================================
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = "models/gemini-1.5-flash"  # free + stable
+GEMINI_MODEL = "models/gemini-1.5-flash-001"
 
-# -------------------------------------------------
+def generate_answer(prompt: str) -> str:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
+    )
+
+    if not response or not response.text:
+        raise RuntimeError("Gemini returned empty response")
+
+    return response.text.strip()
+
+# =================================================
 # Local embedding model (CPU ONLY)
-# -------------------------------------------------
+# =================================================
 embedding_model = SentenceTransformer(
     "all-MiniLM-L6-v2",
     device="cpu"
@@ -55,9 +65,16 @@ embedding_model = SentenceTransformer(
 
 EMBEDDING_DIM = 384
 
-# -------------------------------------------------
+def get_embedding(text: str) -> List[float]:
+    embedding = embedding_model.encode(
+        text,
+        normalize_embeddings=True
+    )
+    return embedding.tolist()
+
+# =================================================
 # Pinecone setup
-# -------------------------------------------------
+# =================================================
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
 if PINECONE_INDEX_NAME not in pc.list_indexes().names():
@@ -73,9 +90,9 @@ if PINECONE_INDEX_NAME not in pc.list_indexes().names():
 
 index = pc.Index(PINECONE_INDEX_NAME)
 
-# -------------------------------------------------
-# Models
-# -------------------------------------------------
+# =================================================
+# Request / Response Models
+# =================================================
 class TextInput(BaseModel):
     text: str
 
@@ -89,9 +106,9 @@ class QueryResponse(BaseModel):
     chunks_retrieved: int
     time_taken: float
 
-# -------------------------------------------------
+# =================================================
 # Helpers
-# -------------------------------------------------
+# =================================================
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
     words = text.split()
     chunks = []
@@ -112,21 +129,12 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
 
     return chunks
 
-
-def get_embedding(text: str) -> list[float]:
-    embedding = embedding_model.encode(
-        text,
-        normalize_embeddings=True
-    )
-    return embedding.tolist()
-
-# -------------------------------------------------
+# =================================================
 # Routes
-# -------------------------------------------------
+# =================================================
 @app.get("/")
 def health():
     return {"status": "healthy", "service": "Mini RAG API"}
-
 
 @app.post("/api/upload-text")
 async def upload_text(data: TextInput):
@@ -158,7 +166,6 @@ async def upload_text(data: TextInput):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/upload-file")
 async def upload_file(file: UploadFile = File(...)):
@@ -192,7 +199,6 @@ async def upload_file(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query_docs(data: QueryInput):
@@ -243,16 +249,10 @@ Question:
 Answer:
 """
 
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-
-        if not response or not response.text:
-            raise RuntimeError("Gemini returned empty response")
+        answer = generate_answer(prompt)
 
         return QueryResponse(
-            answer=response.text.strip(),
+            answer=answer,
             citations=citations,
             chunks_retrieved=len(results.matches),
             time_taken=round(time.time() - start_time, 2)
@@ -261,7 +261,9 @@ Answer:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# =================================================
+# Local run
+# =================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
