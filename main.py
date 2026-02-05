@@ -168,7 +168,10 @@ async def query_docs(data: QueryInput):
             "preview": text[:200] + "..."
         })
 
-    answer = "\n\n".join(context)
+    answer = (
+    "Based on the retrieved information:\n\n"
+    + "\n\n".join(context)
+    )
 
     return QueryResponse(
         answer=answer,
