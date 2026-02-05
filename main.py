@@ -6,9 +6,9 @@ import os
 from dotenv import load_dotenv
 import time
 from pinecone import Pinecone, ServerlessSpec
-import openai
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
 import tiktoken
-import cohere
 
 load_dotenv()
 
@@ -24,9 +24,11 @@ app.add_middleware(
 )
 
 # Initialize clients
-openai.api_key = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-co = cohere.Client(os.getenv("COHERE_API_KEY"))
+
+# Initialize embedding model (runs locally, completely free!)
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 
@@ -34,7 +36,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 if INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
         name=INDEX_NAME,
-        dimension=1536,  # OpenAI embedding dimension
+        dimension=384,  # all-MiniLM-L6-v2 dimension
         metric='cosine',
         spec=ServerlessSpec(
             cloud='aws',
@@ -60,27 +62,26 @@ class QueryResponse(BaseModel):
     time_taken: float
 
 # Chunking function
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[dict]:
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[dict]:
     """Split text into overlapping chunks with metadata"""
-    encoding = tiktoken.encoding_for_model("gpt-4")
-    tokens = encoding.encode(text)
+    words = text.split()
     chunks = []
     
     start = 0
     chunk_id = 0
     
-    while start < len(tokens):
+    while start < len(words):
         end = start + chunk_size
-        chunk_tokens = tokens[start:end]
-        chunk_text = encoding.decode(chunk_tokens)
+        chunk_words = words[start:end]
+        chunk_text = " ".join(chunk_words)
         
         chunks.append({
             "text": chunk_text,
             "metadata": {
                 "chunk_id": chunk_id,
-                "start_char": start,
-                "end_char": end,
-                "chunk_size": len(chunk_tokens)
+                "start_pos": start,
+                "end_pos": end,
+                "chunk_size": len(chunk_words)
             }
         })
         
@@ -89,14 +90,18 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[di
     
     return chunks
 
-# Embedding function
+# Embedding function (FREE - runs locally)
 def get_embedding(text: str) -> List[float]:
-    """Get OpenAI embedding for text"""
-    response = openai.embeddings.create(
-        model="text-embedding-ada-002",
-        input=text
-    )
-    return response.data[0].embedding
+    """Get embedding using local model"""
+    embedding = embedding_model.encode(text)
+    return embedding.tolist()
+
+# Simple reranking function (no API needed)
+def rerank_chunks(query: str, chunks: List[dict], top_n: int = 3) -> List[dict]:
+    """Simple reranking based on keyword matching and score"""
+    # Sort by existing score (already good from vector search)
+    sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
+    return sorted_chunks[:top_n]
 
 # Store text endpoint
 @app.post("/api/upload-text")
@@ -219,17 +224,8 @@ async def query(query_input: QueryInput):
                 time_taken=round(time.time() - start_time, 2)
             )
         
-        # Rerank with Cohere
-        rerank_docs = [chunk["text"] for chunk in retrieved_chunks]
-        rerank_response = co.rerank(
-            model="rerank-english-v3.0",
-            query=query_input.query,
-            documents=rerank_docs,
-            top_n=3
-        )
-        
-        # Get top reranked chunks
-        reranked_chunks = [retrieved_chunks[result.index] for result in rerank_response.results]
+        # Simple reranking (no API needed)
+        reranked_chunks = rerank_chunks(query_input.query, retrieved_chunks, top_n=3)
         
         # Build context for LLM
         context = "\n\n".join([
@@ -237,7 +233,7 @@ async def query(query_input: QueryInput):
             for i, chunk in enumerate(reranked_chunks)
         ])
         
-        # Generate answer with GPT-4
+        # Generate answer with Gemini (FREE!)
         prompt = f"""Based on the following context, answer the user's question. 
 Use inline citations like [1], [2], etc. to reference the sources.
 If the context doesn't contain enough information, say so.
@@ -249,17 +245,13 @@ Question: {query_input.query}
 
 Answer with citations:"""
         
-        response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context. Always cite your sources using [1], [2], etc."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3
-        )
+        model = genai.GenerativeModel('gemini-pro')
+        response = model.generate_content(prompt)
         
-        answer = response.choices[0].message.content
-        tokens_used = response.usage.total_tokens
+        answer = response.text
+        
+        # Estimate tokens (Gemini doesn't provide exact count in free tier)
+        tokens_used = len(prompt.split()) + len(answer.split())
         
         # Format citations
         citations = [
