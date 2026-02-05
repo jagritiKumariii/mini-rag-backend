@@ -36,7 +36,7 @@ INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "mini-rag-index")
 if INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
         name=INDEX_NAME,
-        dimension=768,  # all-MiniLM-L6-v2 dimension
+        dimension=384,  # all-MiniLM-L6-v2 dimension
         metric='cosine',
         spec=ServerlessSpec(
             cloud='aws',
@@ -90,15 +90,27 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[dict
     
     return chunks
 
-# Embedding function (FREE - runs locally)
+import requests
+
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
 def get_embedding(text: str) -> list[float]:
-    embedding_model = "models/embedding-001"
-    result = genai.embed_content(
-        model=embedding_model,
-        content=text,
-        task_type="retrieval_document"
-    )
-    return result["embedding"]
+    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": text,
+        "options": {"wait_for_model": True}
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+
+    embedding = response.json()
+    return embedding[0]  # first vector
 
 
 # Simple reranking function (no API needed)
